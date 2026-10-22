@@ -295,6 +295,43 @@ describe("ShellTool scanner permissions", () => {
   for (const portable of [false, true]) {
     const scanner = portable ? "native" : "legacy"
 
+    test(`${scanner}: relative cd chains stay inside the project`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Promise.all([
+              fs.mkdir(path.join(fixture.active, "layer-a")),
+              fs.mkdir(path.join(fixture.active, "layer-b")),
+            ]),
+          )
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "external_directory", resource: "*", effect: "deny" },
+              ]
+            }),
+          )
+          const marker = path.join(fixture.active, "marker")
+          for (const first of ["layer-a", `'${path.join(fixture.active, "layer-a")}'`]) {
+            const result = yield* runPermissionCommand(
+              registry,
+              `cd ${first} && ls; echo done; cd ../layer-b && pwd -P > '${marker}'`,
+              marker,
+              [],
+            )
+            expect(result.exit).toMatchObject({
+              _tag: "Success",
+              value: { status: "completed", metadata: { exit: 0 } },
+            })
+            expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe(
+              path.join(fixture.active, "layer-b") + "\n",
+            )
+          }
+        }),
+      ))
+
     test(`${scanner}: declarations reuse approvals while substitutions retain reject/once/always behavior`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {
@@ -407,6 +444,7 @@ describe("ShellTool scanner permissions", () => {
     test(`${scanner}: external-directory rejection stops execution before a workspace marker is written`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {
+          yield* Effect.promise(() => fs.mkdir(path.join(fixture.active, "layer-a")))
           const agents = yield* Agent.Service
           yield* agents.transform((editor) =>
             editor.update(toolIdentity.agent, (agent) => {
@@ -414,7 +452,7 @@ describe("ShellTool scanner permissions", () => {
             }),
           )
           const marker = path.join(fixture.active, "marker")
-          const command = `cd '${fixture.outside}' && pwd -P && printf reached > '${marker}'`
+          const command = `cd layer-a && cd ../../outside && pwd -P && printf reached > '${marker}'`
           for (const reply of ["reject", "once"] as const) {
             const result = yield* runPermissionCommand(registry, command, marker, [reply])
             expect(result.requests).toMatchObject([

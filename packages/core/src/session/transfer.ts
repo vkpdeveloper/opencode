@@ -5,7 +5,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Skill } from "@opencode/schema/skill"
 import { eq } from "drizzle-orm"
 import { Clock, Context, DateTime, Effect, Layer, Schema } from "effect"
-import { map } from "effect/Array"
+import { chunksOf, map } from "effect/Array"
 import path from "path"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { App } from "../app.js"
@@ -110,7 +110,12 @@ const layer = Layer.effect(
               commit: (seq) =>
                 Effect.gen(function* () {
                   if (messages.length > 0) {
-                    yield* db.insert(SessionMessageTable).values(messages).run().pipe(Effect.orDie)
+                    // Each row binds seven values; keep inserts below SQLite's bind limit.
+                    yield* Effect.forEach(
+                      chunksOf(messages, 1_000),
+                      (batch) => db.insert(SessionMessageTable).values(batch).run().pipe(Effect.orDie),
+                      { discard: true },
+                    )
                     yield* Bus.reserveSequence(db, sessionID, seq + messages.length)
                   }
                   yield* db

@@ -22,11 +22,63 @@ const setup = Effect.gen(function* () {
           body: body === undefined ? undefined : JSON.stringify(body),
         }),
       )
-      const json: unknown = await response.json()
       expect(response.status).toBe(status)
+      if (status === 500) return response.text()
+      const json: unknown = await response.json()
       return json
     })
 })
+
+it.live("imports a transcript above the SQLite bind limit without losing message order or content", () =>
+  Effect.gen(function* () {
+    const request = yield* setup
+    const template = Schema.decodeUnknownSync(SessionResponse)(yield* request("/api/session", {}))
+    const id = Session.ID.create()
+    // Exceeds 65,535 bindings and leaves a partial final batch.
+    const messages = Array.from({ length: 10_001 }, (_, index) => ({
+      id: `msg_large_${index}`,
+      type: "synthetic",
+      text: `Message ${index}`,
+      time: { created: 1 },
+    }))
+    expect(
+      yield* request("/api/experimental/session/import", {
+        info: { ...template.data, id },
+        messages,
+      }),
+    ).toMatchObject({ data: { id } })
+    expect(yield* request(`/api/experimental/session/${id}/export`)).toMatchObject({
+      data: { info: { id }, messages },
+    })
+  }).pipe(Effect.scoped),
+)
+
+it.live("rolls back earlier import batches when a later message conflicts and allows retry", () =>
+  Effect.gen(function* () {
+    const request = yield* setup
+    const template = Schema.decodeUnknownSync(SessionResponse)(yield* request("/api/session", {}))
+    const id = Session.ID.create()
+    const messages = Array.from({ length: 1_001 }, (_, index) => ({
+      id: `msg_rollback_${index}`,
+      type: "synthetic",
+      text: `Message ${index}`,
+      time: { created: 1 },
+    }))
+    yield* request(
+      "/api/experimental/session/import",
+      { info: { ...template.data, id }, messages: [...messages, messages[0]] },
+      500,
+    )
+    expect(yield* request(`/api/session/${id}`, undefined, 404)).toMatchObject({
+      _tag: "SessionNotFoundError",
+      sessionID: id,
+    })
+    yield* request("/api/experimental/session/import", { info: { ...template.data, id }, messages })
+    expect(yield* request(`/api/experimental/session/${id}/export`)).toMatchObject({
+      data: { info: { id }, messages },
+    })
+  }).pipe(Effect.scoped),
+)
 
 it.live("preserves imported parentID through HTTP import, read, and parent filter", () =>
   Effect.gen(function* () {

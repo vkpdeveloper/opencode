@@ -19,7 +19,7 @@ describe("Bash arithmetic expansions", () => {
     "$((1 + '2'))",
   ])("preserves arithmetic without evaluating it: %s", (expression) => {
     for (const argument of [expression, `"${expression}"`]) {
-      expect(ShellScan.scan(`echo ${argument}`)).toEqual({
+      expect(ShellScan.scan(`echo ${argument}`)).toMatchObject({
         kind: "scanned",
         commands: [{ resource: `echo ${argument}`, words: ["echo", expression], rawWords: ["echo", argument] }],
       })
@@ -38,7 +38,7 @@ describe("Bash arithmetic expansions", () => {
       const result = ShellScan.scan(`echo ${argument}; pwd`)
       expect(result.kind).toBe("scanned")
       if (result.kind === "opaque") return
-      expect(result.commands[0]).toEqual({
+      expect(result.commands[0]).toMatchObject({
         resource: `echo ${argument}`,
         words: ["echo", expression],
         rawWords: ["echo", argument],
@@ -46,7 +46,7 @@ describe("Bash arithmetic expansions", () => {
       expect(result.commands.slice(1, -1).map((command) => command.words[0])).toEqual(
         expression.includes('"$(printf') ? ["printf", "printf"] : ["printf"],
       )
-      expect(result.commands.at(-1)).toEqual({ resource: "pwd", words: ["pwd"], rawWords: ["pwd"] })
+      expect(result.commands.at(-1)).toMatchObject({ resource: "pwd", words: ["pwd"], rawWords: ["pwd"] })
     }
   })
 
@@ -65,7 +65,7 @@ describe("Bash arithmetic expansions", () => {
   })
 
   test("does not expand arithmetic inside single quotes", () => {
-    expect(ShellScan.scan("echo '$((1 + $(ignored)))'")).toEqual({
+    expect(ShellScan.scan("echo '$((1 + $(ignored)))'")).toMatchObject({
       kind: "scanned",
       commands: [
         {

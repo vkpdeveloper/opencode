@@ -126,7 +126,14 @@ export const Plugin = {
       const portable =
         Config.latest(yield* config.entries(), "experimental")?.portable_shell_scanner ??
         (shellParserWasm.bash === "" || ctx.app.channel === "local" || ctx.app.channel === "dev")
-      const parsed = yield* ShellParse.scan(invocation.command, invocation.shell, target.absolute, { portable })
+      const parsed = yield* ShellParse.scan(invocation.command, invocation.shell, target.absolute, {
+        portable,
+        isDirectory: (directory) =>
+          Environment.typeFollowing(environment.files, directory).pipe(
+            Effect.map((type) => type === "directory"),
+            Effect.catch(() => Effect.succeed(false)),
+          ),
+      })
       const directories = yield* Effect.forEach(parsed.directories, (directory) =>
         access.resolve({
           path: FileAccess.resolvePath(target.absolute, directory),

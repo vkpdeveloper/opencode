@@ -9,6 +9,7 @@ import { shellParserWasm } from "#shell-parser-wasm"
 import { ShellSelect } from "./select.js"
 import { lazy } from "../util/lazy.js"
 import { Wildcard } from "../util/wildcard.js"
+import type { Sequence } from "./scan.js"
 
 type Part = { type: string; text: string }
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
@@ -18,6 +19,12 @@ const POWERSHELL_PATH_FLAG_RE =
 export type Result = {
   commands: Array<{ resource: string; save: string }>
   directories: string[]
+}
+
+type Options = {
+  portable?: boolean
+  wasm?: typeof shellParserWasm
+  isDirectory?: (directory: string) => Effect.Effect<boolean>
 }
 
 const ARITY: Record<string, number> = {
@@ -161,52 +168,53 @@ const ARITY: Record<string, number> = {
 }
 const PREFIX_LENGTH = Math.max(...Object.values(ARITY))
 
-export const scan = Effect.fnUntraced(function* (
-  command: string,
-  shell: string,
-  cwd: string,
-  options?: { portable?: boolean; wasm?: typeof shellParserWasm },
-) {
+export const scan = Effect.fnUntraced(function* (command: string, shell: string, cwd: string, options?: Options) {
   if (options?.portable || (options?.wasm ?? shellParserWasm).bash === "")
-    return yield* scanPortable(command, shell, cwd)
-  return yield* scanLegacy(command, shell, cwd)
+    return yield* scanPortable(command, shell, cwd, options)
+  return yield* scanLegacy(command, shell, cwd, options)
 })
 
-const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
+const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string, options?: Options) {
   const parsers = yield* Effect.promise(load)
   const powershell = ShellSelect.ps(shell)
   const tree = (powershell ? parsers.ps : parsers.bash).parse(command)
   if (!tree) return yield* Effect.fail(new Error("Failed to parse shell command"))
+  const directories = directoryTracker(cwd, shell, options)
 
   return yield* Effect.acquireUseRelease(
     Effect.succeed(tree),
     (tree) =>
-      Effect.sync(() =>
-        tree.rootNode.descendantsOfType("command").reduce(
-          (result, node) => {
-            if (!node) return result
-            const command = parts(node)
-            const tokens = command.map((part) => part.text)
-            if (tokens.length === 0) return result
-            const name = powershell ? tokens[0].toLowerCase() : tokens[0]
-            if (CWD.has(name)) {
-              result.directories.push(...directoryArgs(command, powershell, cwd, shell))
-              return result
-            }
-            result.commands.push({
-              resource: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
-              save: `${prefix(tokens).join(" ")} *`,
-            })
-            return result
-          },
-          { commands: [] as Array<{ resource: string; save: string }>, directories: [] as string[] },
-        ),
-      ),
+      Effect.gen(function* () {
+        const result: Result = { commands: [], directories: [] }
+        for (const node of tree.rootNode.descendantsOfType("command")) {
+          if (!node) continue
+          const command = parts(node)
+          const tokens = command.map((part) => part.text)
+          if (tokens.length === 0) continue
+          const name = powershell ? tokens[0].toLowerCase() : tokens[0]
+          if (CWD.has(name)) {
+            result.directories.push(
+              ...(yield* directories(command, powershell, powershell ? undefined : sequence(node))),
+            )
+            continue
+          }
+          result.commands.push({
+            resource: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
+            save: `${prefix(tokens).join(" ")} *`,
+          })
+        }
+        return result
+      }),
     (tree) => Effect.sync(() => tree.delete()),
   )
 })
 
-export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
+export const scanPortable = Effect.fnUntraced(function* (
+  command: string,
+  shell: string,
+  cwd: string,
+  options?: Options,
+) {
   const { ShellScan } = yield* Effect.tryPromise({
     try: () => import("./scan.js"),
     catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
@@ -215,11 +223,12 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
   const name = ShellSelect.name(shell)
   const result = powershell
     ? ShellScan.scanPowerShell(command)
-    : ShellScan.scan(command, name === "bash" || name === "zsh" ? name : "posix")
+    : ShellScan.scan(command, name === "bash" || name === "zsh" ? name : "posix", { sequence: true })
   if (result.kind === "opaque")
     return yield* Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
 
   const output: Result = { commands: [], directories: [] }
+  const directories = directoryTracker(cwd, shell, options)
   for (const item of result.commands) {
     // The legacy command walk skips declarations, not the substitutions within them.
     if (item.declaration) continue
@@ -236,7 +245,7 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
     const name = powershell ? words[0]?.toLowerCase() : words[0]
     if (CWD.has(name)) {
       output.directories.push(
-        ...directoryArgs(
+        ...(yield* directories(
           powershell
             ? words.flatMap((raw, index): Part[] => {
                 const text =
@@ -258,9 +267,8 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
                 text: text.startsWith("$'") || (!/[$`~\\]/.test(text) && /['"]/.test(text)) ? item.words[index] : text,
               })),
           powershell,
-          cwd,
-          shell,
-        ),
+          item.sequence,
+        )),
       )
       continue
     }
@@ -286,6 +294,39 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
   }
   return output
 })
+
+function sequence(node: Node) {
+  const result: Sequence = {}
+  for (let current = node; current.parent; current = current.parent) {
+    if (!["program", "list", "redirected_statement"].includes(current.parent.type)) return
+    result.before ??= current.previousSibling?.text
+    result.after ??= current.nextSibling?.text
+  }
+  return result
+}
+
+function directoryTracker(cwd: string, shell: string, options?: Options) {
+  const state = { cwd }
+  return Effect.fnUntraced(function* (command: Part[], powershell: boolean, sequence?: Sequence) {
+    // Nested shells, pipelines and conditional alternatives retain independent analysis.
+    const sequential =
+      !powershell &&
+      sequence &&
+      ![sequence.before, sequence.after].some((value) => value !== undefined && ["|", "|&", "||", "&"].includes(value))
+    const current = sequential ? state.cwd : cwd
+    const directories = directoryArgs(command, powershell, current, shell)
+    const resolved = current === cwd ? directories : directories.map((directory) => path.resolve(current, directory))
+    if (!sequential) return resolved
+    if (directories.length !== 1 || !["cd", "pushd"].includes(command[0].text)) {
+      state.cwd = cwd
+      return resolved
+    }
+    const target = path.resolve(current, directories[0])
+    // A failed cd leaves the shell in its previous directory, including across semicolons.
+    if (!options?.isDirectory || (yield* options.isDirectory(target))) state.cwd = target
+    return resolved
+  })
+}
 
 function parts(node: Node) {
   return Array.from({ length: node.childCount }).flatMap((_, index): Part[] => {

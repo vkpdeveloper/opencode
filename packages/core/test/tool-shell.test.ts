@@ -404,6 +404,92 @@ describe("ShellTool scanner permissions", () => {
         }),
       ))
 
+    test(`${scanner}: relative cd chains stay inside the project without external-directory approval`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Promise.all([
+              fs.mkdir(path.join(fixture.active, "layer-a")),
+              fs.mkdir(path.join(fixture.active, "layer-b")),
+            ]),
+          )
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "external_directory", resource: "*", effect: "deny" },
+              ]
+            }),
+          )
+          const marker = path.join(fixture.active, "marker")
+          for (const first of ["layer-a", path.join(fixture.active, "layer-a")]) {
+            const result = yield* runPermissionCommand(
+              registry,
+              `cd '${first}' && pwd; echo done; cd ../layer-b && pwd && printf reached > '${marker}'`,
+              marker,
+              [],
+            )
+            expect(result.requests).toEqual([])
+            expect(result.exit).toMatchObject({
+              _tag: "Success",
+              value: {
+                status: "completed",
+                metadata: { exit: 0 },
+                content: [
+                  {
+                    type: "text",
+                    text: `${path.join(fixture.active, "layer-a")}\ndone\n${path.join(fixture.active, "layer-b")}\n`,
+                  },
+                ],
+              },
+            })
+            expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("reached")
+            yield* Effect.promise(() => fs.rm(marker))
+          }
+        }),
+      ))
+
+    test(`${scanner}: relative cd chains still request approval for the actual external destination`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => fs.mkdir(path.join(fixture.active, "layer-a")))
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [{ action: "shell", resource: "*", effect: "allow" }]
+            }),
+          )
+          const marker = path.join(fixture.active, "marker")
+          const command = `cd layer-a && pwd; cd ../../outside && pwd && printf reached > '${marker}'`
+          for (const reply of ["reject", "once"] as const) {
+            const result = yield* runPermissionCommand(registry, command, marker, [reply])
+            expect(result.requests).toMatchObject([
+              { action: "external_directory", resources: [path.join(fixture.outside, "*")] },
+            ])
+            if (reply === "reject") {
+              expect(Exit.isFailure(result.exit)).toBe(true)
+              expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+              continue
+            }
+            expect(result.exit).toMatchObject({
+              _tag: "Success",
+              value: {
+                status: "completed",
+                metadata: { exit: 0 },
+                content: [
+                  {
+                    type: "text",
+                    text: `${path.join(fixture.active, "layer-a")}\n${fixture.outside}\n`,
+                  },
+                ],
+              },
+            })
+            expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("reached")
+          }
+        }),
+      ))
+
     test(`${scanner}: external-directory rejection stops execution before a workspace marker is written`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {

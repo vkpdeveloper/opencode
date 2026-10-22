@@ -76,7 +76,14 @@ export const Plugin = define({
         })
         const definitions = new Map<string, { readonly inherit: boolean; readonly base?: Model.Info }>()
         for (const [id, config] of Object.entries(item.models ?? {})) {
-          const base = source?.models.get(config.modelID ?? id) ?? source?.models.get(id)
+          const modelID = config.modelID ?? id
+          const exact = source?.models.get(modelID) ?? source?.models.get(id)
+          const routed =
+            !exact && source?.provider.id === Provider.ID.openrouter
+              ? source.models.get(modelID.replace(/:.*/, ""))
+              : undefined
+          // Routing suffixes share base metadata, but must still reach OpenRouter in the request model ID.
+          const base = exact ?? (routed && { ...routed, modelID: Model.ID.make(modelID) })
           const inherit = changed || !current?.models.has(id)
           // Bind the source at this point in the provider fold. Later source edits/removal
           // and its credential availability must not change an already-defined alias.

@@ -21,6 +21,8 @@ type Command = {
   declaration?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
+  // Source span of a command in a top-level, sequential Bash list.
+  range?: { start: number; end: number; redirected?: boolean }
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
@@ -155,6 +157,9 @@ type BashState = {
   context: BashContext
   commands: Command[]
   nestedCommands: Command[]
+  topLevel: boolean
+  sequential: boolean
+  list: Command[]
   words: string[]
   rawWords: string[]
   // Pending heredocs, shared with nested groups: a body starts after the next newline token at any nesting.
@@ -348,6 +353,10 @@ function finishBashCommand(state: BashState, boundary = false) {
   if (state.compoundEnd && state.words.length > 0) state.invalid ??= "invalid-structure"
   const name = state.commandWordIndex
   const inHeader = bashInHeader(state)
+  if (state.compoundEnd) {
+    state.list.splice(0).forEach((command) => delete command.range)
+    state.sequential = false
+  }
   if (name >= 0 && !state.words[name]) state.invalid ??= "invalid-structure"
   if (name >= 0 && !inHeader) {
     const resource = state.input
@@ -357,6 +366,15 @@ function finishBashCommand(state: BashState, boundary = false) {
       resource,
       words: state.words.slice(name),
       rawWords: state.rawWords.slice(name),
+      ...(state.topLevel && state.sequential && state.structures.length === 0 && state.commandStart !== undefined
+        ? {
+            range: {
+              start: state.commandStart,
+              end: state.wordEnd,
+              ...(state.hasRedirect ? { redirected: true } : {}),
+            },
+          }
+        : {}),
       ...(name === 0 && BASH_DECLARATIONS.has(state.rawWords[0]) && resource.startsWith(state.rawWords[0])
         ? { declaration: true as const }
         : {}),
@@ -365,6 +383,7 @@ function finishBashCommand(state: BashState, boundary = false) {
         : {}),
     }
     state.commands.push(command)
+    if (command.range) state.list.push(command)
     const builtin = bashBuiltinIndex(state)
     const builtinName = state.words[builtin]
     const builtinArgs = state.words.slice(builtin + 1)
@@ -443,6 +462,9 @@ function scanBash(
     context,
     commands: [],
     nestedCommands: [],
+    topLevel: depth === 0,
+    sequential: true,
+    list: [],
     words: [],
     rawWords: [],
     heredocs: heredocs ?? [],
@@ -706,6 +728,14 @@ function scanBashOperatorOrSeparator(
   }
   if (separator === "\n" && !pending(state)) return readBashHeredocs(state, index, depth, context)
   finishBashCommand(state, true)
+  if (["||", "|", "|&", "&"].includes(separator)) {
+    state.list.splice(0).forEach((command) => delete command.range)
+    state.sequential = false
+  }
+  if (separator === ";" || separator === "\n" || separator === "&") {
+    state.list.length = 0
+    state.sequential = true
+  }
   if (structure?.kind === "for" && structure.phase === "header") structure.phase = "do"
   state.dangling = separator !== "&" && separator !== ";" && separator !== "\n"
   // Reprocess the newline to read pending heredoc bodies.
@@ -724,6 +754,7 @@ function readBashHeredocs(state: BashState, index: number, depth: number, contex
     const body = bashHeredoc(state.input, end + 1, heredoc)
     if (!body) return { kind: "opaque", reason: "heredoc" } satisfies Opaque
     if (heredoc.command) heredoc.command.resource = state.input.slice(heredoc.start, body.end).trim()
+    if (heredoc.command?.range) heredoc.command.range.end = body.end
     const text = heredoc.quoted ? { word: body.source, literal: body.source, output: "" } : bashText()
     if (!heredoc.quoted) {
       const expansion = scanBashSpan(body.source, 0, depth, context, state.commands, BASH_SPANS.heredoc, true, text)
@@ -794,7 +825,11 @@ function scanBashCommandStart(
   if (functionHead) return index + functionHead - 1
   if (atStart && char === "!") {
     NEGATION_AHEAD_RE.lastIndex = index + 1
-    if (NEGATION_AHEAD_RE.test(input)) return index
+    if (NEGATION_AHEAD_RE.test(input)) {
+      state.list.splice(0).forEach((command) => delete command.range)
+      state.sequential = false
+      return index
+    }
   }
   const forHeader = structure?.kind === "for" && structure.phase === "header"
   const compoundOpen =

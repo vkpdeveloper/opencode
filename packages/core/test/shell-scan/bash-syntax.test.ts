@@ -231,7 +231,7 @@ describe("Bash shared heredoc delimiter grammar", () => {
         ...(quoted ? [] : ["printf"]),
         "printf",
       ])
-      expect(result.commands.find((command) => command.words[0] === "cat")).toEqual({
+      expect(result.commands.find((command) => command.words[0] === "cat")).toMatchObject({
         resource: body.trim(),
         words: ["cat"],
         rawWords: ["cat"],

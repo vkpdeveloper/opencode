@@ -15,6 +15,15 @@ const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-locat
 const POWERSHELL_PATH_FLAG_RE =
   /^-(?:p(?:ath|at|a)?|lp|l(?:i(?:t(?:e(?:r(?:a(?:l(?:p(?:a(?:t(?:h)?)?)?)?)?)?)?)?)?)?|psp(?:a(?:t(?:h)?)?)?):?$/i
 
+type Options = {
+  portable?: boolean
+  wasm?: typeof shellParserWasm
+  // Check the shell's filesystem before carrying a directory change past an unconditional separator.
+  isDirectory?: (directory: string) => Effect.Effect<boolean>
+}
+
+type Range = { start: number; end: number; redirected?: boolean }
+
 export type Result = {
   commands: Array<{ resource: string; save: string }>
   directories: string[]
@@ -161,18 +170,13 @@ const ARITY: Record<string, number> = {
 }
 const PREFIX_LENGTH = Math.max(...Object.values(ARITY))
 
-export const scan = Effect.fnUntraced(function* (
-  command: string,
-  shell: string,
-  cwd: string,
-  options?: { portable?: boolean; wasm?: typeof shellParserWasm },
-) {
+export const scan = Effect.fnUntraced(function* (command: string, shell: string, cwd: string, options?: Options) {
   if (options?.portable || (options?.wasm ?? shellParserWasm).bash === "")
-    return yield* scanPortable(command, shell, cwd)
-  return yield* scanLegacy(command, shell, cwd)
+    return yield* scanPortable(command, shell, cwd, options)
+  return yield* scanLegacy(command, shell, cwd, options)
 })
 
-const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
+const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, cwd: string, options?: Options) {
   const parsers = yield* Effect.promise(load)
   const powershell = ShellSelect.ps(shell)
   const tree = (powershell ? parsers.ps : parsers.bash).parse(command)
@@ -181,32 +185,34 @@ const scanLegacy = Effect.fnUntraced(function* (command: string, shell: string, 
   return yield* Effect.acquireUseRelease(
     Effect.succeed(tree),
     (tree) =>
-      Effect.sync(() =>
-        tree.rootNode.descendantsOfType("command").reduce(
-          (result, node) => {
-            if (!node) return result
-            const command = parts(node)
-            const tokens = command.map((part) => part.text)
-            if (tokens.length === 0) return result
-            const name = powershell ? tokens[0].toLowerCase() : tokens[0]
-            if (CWD.has(name)) {
-              result.directories.push(...directoryArgs(command, powershell, cwd, shell))
-              return result
-            }
-            result.commands.push({
-              resource: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
-              save: `${prefix(tokens).join(" ")} *`,
-            })
-            return result
-          },
-          { commands: [] as Array<{ resource: string; save: string }>, directories: [] as string[] },
-        ),
-      ),
+      Effect.gen(function* () {
+        const result: Result = { commands: [], directories: [] }
+        const collect = directoryTracker(command, shell, cwd, options)
+        for (const node of tree.rootNode.descendantsOfType("command")) {
+          if (!node) continue
+          const command = parts(node)
+          const tokens = command.map((part) => part.text)
+          if (tokens.length === 0) continue
+          result.directories.push(...(yield* collect(command, sequentialRange(node))))
+          const name = powershell ? tokens[0].toLowerCase() : tokens[0]
+          if (CWD.has(name)) continue
+          result.commands.push({
+            resource: (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim(),
+            save: `${prefix(tokens).join(" ")} *`,
+          })
+        }
+        return result
+      }),
     (tree) => Effect.sync(() => tree.delete()),
   )
 })
 
-export const scanPortable = Effect.fnUntraced(function* (command: string, shell: string, cwd: string) {
+export const scanPortable = Effect.fnUntraced(function* (
+  command: string,
+  shell: string,
+  cwd: string,
+  options?: Options,
+) {
   const { ShellScan } = yield* Effect.tryPromise({
     try: () => import("./scan.js"),
     catch: (cause) => new Error(`Portable shell scanner failed to load: ${cause}`, { cause }),
@@ -220,6 +226,7 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
     return yield* Effect.fail(new Error(`Portable shell scanner cannot analyze command: ${result.reason}`))
 
   const output: Result = { commands: [], directories: [] }
+  const collect = directoryTracker(command, shell, cwd, options)
   for (const item of result.commands) {
     // The legacy command walk skips declarations, not the substitutions within them.
     if (item.declaration) continue
@@ -236,7 +243,7 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
     const name = powershell ? words[0]?.toLowerCase() : words[0]
     if (CWD.has(name)) {
       output.directories.push(
-        ...directoryArgs(
+        ...(yield* collect(
           powershell
             ? words.flatMap((raw, index): Part[] => {
                 const text =
@@ -257,13 +264,12 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
                 // Only literal quoting resolves to a static directory.
                 text: text.startsWith("$'") || (!/[$`~\\]/.test(text) && /['"]/.test(text)) ? item.words[index] : text,
               })),
-          powershell,
-          cwd,
-          shell,
-        ),
+          item.range,
+        )),
       )
       continue
     }
+    yield* collect([{ type: "word", text: name }], item.range)
     const selected = prefix(words.slice(0, PREFIX_LENGTH))
     const conventional = `${selected.join(" ")} *`
     const end = item.wordEnds?.[selected.length - 1]
@@ -286,6 +292,75 @@ export const scanPortable = Effect.fnUntraced(function* (command: string, shell:
   }
   return output
 })
+
+// Only straight-line top-level lists share cwd. Other constructs retain the starting-directory fallback.
+function sequentialRange(node: Node): Range | undefined {
+  const range: Range = { start: node.startIndex, end: node.endIndex }
+  if (node.children.some((child) => child?.type === "file_redirect")) range.redirected = true
+  for (let current = node; current.parent; current = current.parent) {
+    if (current.parent.type === "program") {
+      if (current.nextSibling?.type === "&") return
+      return range
+    }
+    if (current.parent.type === "redirected_statement") {
+      // The grammar wraps a whole && list, although the redirect belongs to its final command.
+      if (current.endIndex === range.end) {
+        range.end = current.parent.endIndex
+        range.redirected = true
+      }
+      continue
+    }
+    if (
+      current.parent.type !== "list" ||
+      current.parent.children.some(
+        (child) => child && !["command", "list", "redirected_statement", "&&", "comment"].includes(child.type),
+      )
+    )
+      return
+  }
+}
+
+function directoryTracker(source: string, shell: string, cwd: string, options?: Options) {
+  const powershell = ShellSelect.ps(shell)
+  let current = cwd
+  // && uses the success path; ; and newlines resume from directory changes known to have run.
+  let confirmed = cwd
+  let end = 0
+  let certain = true
+  let success = false
+  return Effect.fnUntraced(function* (command: Part[], range?: Range) {
+    const name = powershell ? command[0]?.text.toLowerCase() : command[0]?.text
+    if (powershell || !range) return CWD.has(name) ? directoryArgs(command, powershell, cwd, shell) : []
+    const separator = source
+      .slice(end, range.start)
+      .replace(/\\\n|#[^\n]*/g, "")
+      .trim()
+    if (separator === "&&") certain &&= success
+    if (separator === "" || separator === ";") {
+      current = confirmed
+      certain = true
+    }
+    if (separator !== "" && separator !== ";" && separator !== "&&") {
+      current = cwd
+      confirmed = cwd
+      certain = true
+    }
+    end = range.end
+    success = false
+    if (!CWD.has(name)) return []
+    const directories = directoryArgs(command, false, current, shell)
+    const resolved = directories.map((directory) => (current === cwd ? directory : path.resolve(current, directory)))
+    if (!["cd", "chdir", "pushd"].includes(name) || directories.length !== 1) {
+      current = cwd
+      confirmed = cwd
+      return resolved
+    }
+    current = path.resolve(current, directories[0])
+    success = !range.redirected && options?.isDirectory ? yield* options.isDirectory(current) : false
+    if (certain && success) confirmed = current
+    return resolved
+  })
+}
 
 function parts(node: Node) {
   return Array.from({ length: node.childCount }).flatMap((_, index): Part[] => {

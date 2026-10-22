@@ -10,7 +10,7 @@ describe("ShellScan", () => {
   test.each(["\n\ngit status\n\n", "# before\n\ngit status\n\n# after\n", "git status; # after\n\n"])(
     "does not treat blank lines or comments as missing commands: %j",
     (source) =>
-      expect(ShellScan.scan(source)).toEqual({
+      expect(ShellScan.scan(source)).toMatchObject({
         kind: "scanned",
         commands: [{ resource: "git status", words: ["git", "status"], rawWords: ["git", "status"] }],
       }),
@@ -18,7 +18,7 @@ describe("ShellScan", () => {
 
   test.each(["&&", "||", "|", "|&"])("retains required operands across line breaks after %s", (operator) => {
     expect(ShellScan.scan(`printf ok ${operator}\n\n# comment\n`).kind).toBe("opaque")
-    expect(ShellScan.scan(`printf ok ${operator}\n\n# comment\npwd\n\n`)).toEqual({
+    expect(ShellScan.scan(`printf ok ${operator}\n\n# comment\npwd\n\n`)).toMatchObject({
       kind: "scanned",
       commands: [
         { resource: "printf ok", words: ["printf", "ok"], rawWords: ["printf", "ok"] },
@@ -120,7 +120,7 @@ describe("ShellScan", () => {
   })
 
   test("preserves dynamic command syntax without resolving its name", () => {
-    expect(ShellScan.scan("$COMMAND status")).toEqual({
+    expect(ShellScan.scan("$COMMAND status")).toMatchObject({
       kind: "scanned",
       commands: [{ resource: "$COMMAND status", words: ["$COMMAND", "status"], rawWords: ["$COMMAND", "status"] }],
     })
@@ -256,22 +256,31 @@ describe("ShellScan lexical provenance", () => {
           resource: source,
           words: ["git", "status", "a b", ""],
           rawWords: ['g"it"', "'status'", "a\\ b", '""'],
+          range: { start: 0, end: source.length, redirected: true },
         },
       ],
     })
   })
 
   test("does not mistake quoted assignment-like words or fd numbers for shell syntax", () => {
-    expect(ShellScan.scan(`F"OO"=bar '123'>out`)).toEqual({
+    const source = `F"OO"=bar '123'>out`
+    expect(ShellScan.scan(source)).toEqual({
       kind: "scanned",
-      commands: [{ resource: `F"OO"=bar '123'>out`, words: ["FOO=bar", "123"], rawWords: ['F"OO"=bar', "'123'"] }],
+      commands: [
+        {
+          resource: source,
+          words: ["FOO=bar", "123"],
+          rawWords: ['F"OO"=bar', "'123'"],
+          range: { start: 0, end: source.length, redirected: true },
+        },
+      ],
     })
   })
 
   test("retains nested Bash substitutions and continuations from the original token", () => {
     const source = "echo \"$(printf '%s' 2)\" a\\\nb; pwd"
     const result = ShellScan.scan(source)
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       kind: "scanned",
       commands: [
         {

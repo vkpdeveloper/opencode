@@ -5,7 +5,7 @@ import { Tool } from "@opencode/schema/tool"
 import { Skill } from "@opencode/schema/skill"
 import { eq } from "drizzle-orm"
 import { Clock, Context, DateTime, Effect, Layer, Schema } from "effect"
-import { map } from "effect/Array"
+import { chunksOf, map } from "effect/Array"
 import path from "path"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { App } from "../app.js"
@@ -110,7 +110,10 @@ const layer = Layer.effect(
               commit: (seq) =>
                 Effect.gen(function* () {
                   if (messages.length > 0) {
-                    yield* db.insert(SessionMessageTable).values(messages).run().pipe(Effect.orDie)
+                    // Bound bind parameters per statement while keeping the import in one transaction.
+                    for (const batch of chunksOf(messages, 1_000)) {
+                      yield* db.insert(SessionMessageTable).values(batch).run().pipe(Effect.orDie)
+                    }
                     yield* Bus.reserveSequence(db, sessionID, seq + messages.length)
                   }
                   yield* db

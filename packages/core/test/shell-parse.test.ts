@@ -1,11 +1,53 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { ShellParse } from "@opencode/core/shell/parse"
 import { shellParserWasm } from "../src/shell/parser-wasm.workerd"
+import { tmpdir } from "./fixture/tmpdir"
 
 describe("ShellParse", () => {
+  test.each([false, true])("tracks directory changes in command order (portable: %s)", async (portable) => {
+    await using tmp = await tmpdir()
+    const cwd = path.join(tmp.path, "project")
+    await Promise.all(
+      ["layer-a", "layer-b", "space dir"].map((name) => fs.mkdir(path.join(cwd, name), { recursive: true })),
+    )
+    await Bun.write(path.join(cwd, "file"), "not a directory")
+
+    for (const shell of ["bash", "zsh"]) {
+      for (const [command, expected] of [
+        ["cd layer-a && ls; echo done; cd ../layer-b && ls", ["layer-a", "layer-b"]],
+        [`cd '${cwd}/layer-a' && ls; cd ../layer-b && ls`, ["layer-a", "layer-b"]],
+        ["cd layer-a; cd ../layer-b", ["layer-a", "layer-b"]],
+        ["cd layer-a\npwd\ncd ../layer-b", ["layer-a", "layer-b"]],
+        ["pushd layer-a && pwd; cd ../layer-b", ["layer-a", "layer-b"]],
+        ["cd 'space dir' && cd ../layer-b", ["space dir", "layer-b"]],
+        ["cd layer-a && cd ../..", ["layer-a", ".."]],
+        ["cd missing; cd ../outside", ["missing", "../outside"]],
+        ["cd file; cd ../outside", ["file", "../outside"]],
+        ["cd missing && pwd; cd ../outside", ["missing", "../outside"]],
+        ["mkdir -p new && cd new && cd ../layer-b", ["new", "layer-b"]],
+        ["cd missing && cd ../layer-b; cd ../outside", ["missing", "layer-b", "../outside"]],
+        ["(cd layer-a); cd ../outside", ["layer-a", "../outside"]],
+        ["echo $(cd layer-a); cd ../outside", ["layer-a", "../outside"]],
+        ["cd layer-a | cat; cd ../outside", ["layer-a", "../outside"]],
+        ["printf value | cd layer-a; cd ../outside", ["layer-a", "../outside"]],
+        ["cd layer-a || cd layer-b; cd ../outside", ["layer-a", "layer-b", "../outside"]],
+        ["cd layer-a & wait; cd ../outside", ["layer-a", "../outside"]],
+        ["cd layer-a && pwd & wait; cd ../outside", ["layer-a", "../outside"]],
+        ["cd layer-a; (pwd); printf value | cat; cd ../layer-b", ["layer-a", "layer-b"]],
+      ] as const) {
+        const result = await Effect.runPromise(ShellParse.scan(command, shell, cwd, { portable }))
+        expect(
+          result.directories.map((directory) => path.resolve(cwd, directory)),
+          `${shell}: ${command}`,
+        ).toEqual(expected.map((directory) => path.resolve(cwd, directory)))
+      }
+    }
+  })
+
   test("splits bash commands and derives reusable prefixes", async () => {
     const result = await Effect.runPromise(
       ShellParse.scan("git status && npm run test -- --watch", "/bin/bash", "/workspace"),

@@ -12,6 +12,26 @@ import { it } from "./lib/effect"
 const timeout = new AIError({
   reason: new TransportError({ message: "Timed out", transport: "http", operation: "request", code: "Timeout" }),
 })
+const idleTimeout = new AIError({
+  reason: new TransportError({
+    message: "Timed out waiting for WebSocket data",
+    transport: "websocket",
+    operation: "read",
+    code: "idle-timeout",
+    phase: "receive",
+    delivery: "accepted",
+  }),
+})
+const disconnected = new AIError({
+  reason: new TransportError({
+    message: "WebSocket closed with code 1006",
+    transport: "websocket",
+    operation: "read",
+    code: "1006",
+    phase: "receive",
+    delivery: "accepted",
+  }),
+})
 const internal = new AIError({ reason: new ProviderInternalError({ message: "internal" }) })
 
 const input = (cause: AIError) => ({
@@ -23,25 +43,47 @@ const input = (cause: AIError) => ({
   retry: SessionRunnerRetry.isRetryable(cause),
 })
 
-// Decisions for `count` consecutive failures of the same cause within one step.
-const decisions = (cause: AIError, count: number) =>
+// Decisions for consecutive failures within one step.
+const decisions = (causes: AIError[]) =>
   Effect.gen(function* () {
     const policy = yield* SessionRunnerRetry.policy(SessionSchema.ID.make("ses_retry"))
-    const results: boolean[] = []
-    for (let i = 0; i < count; i++) results.push((yield* policy(input(cause))).retry)
-    return results
+    return yield* Effect.forEach(causes, (cause) => policy(input(cause)).pipe(Effect.map((decision) => decision.retry)))
   })
 
 describe("SessionRunnerRetry.policy", () => {
   it.effect("stops retrying transport timeouts after three attempts", () =>
     Effect.gen(function* () {
-      expect(yield* decisions(timeout, 4)).toEqual([true, true, true, false])
+      expect(yield* decisions(Array.from({ length: 4 }, () => timeout))).toEqual([true, true, true, false])
+    }),
+  )
+
+  it.effect("stops retrying WebSocket idle timeouts after three attempts", () =>
+    Effect.gen(function* () {
+      expect(yield* decisions(Array.from({ length: 4 }, () => idleTimeout))).toEqual([true, true, true, false])
+    }),
+  )
+
+  it.effect("shares the timeout cap across HTTP and WebSocket failures", () =>
+    Effect.gen(function* () {
+      expect(yield* decisions([timeout, idleTimeout, disconnected, timeout, idleTimeout])).toEqual([
+        true,
+        true,
+        true,
+        true,
+        false,
+      ])
+    }),
+  )
+
+  it.effect("keeps the general allowance for WebSocket connection failures", () =>
+    Effect.gen(function* () {
+      expect(yield* decisions(Array.from({ length: 11 }, () => disconnected))).toEqual([...Array(10).fill(true), false])
     }),
   )
 
   it.effect("keeps the general allowance for other transient failures", () =>
     Effect.gen(function* () {
-      expect(yield* decisions(internal, 11)).toEqual([...Array(10).fill(true), false])
+      expect(yield* decisions(Array.from({ length: 11 }, () => internal))).toEqual([...Array(10).fill(true), false])
     }),
   )
 })

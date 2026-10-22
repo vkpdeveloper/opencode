@@ -76,7 +76,15 @@ export const Plugin = define({
         })
         const definitions = new Map<string, { readonly inherit: boolean; readonly base?: Model.Info }>()
         for (const [id, config] of Object.entries(item.models ?? {})) {
-          const base = source?.models.get(config.modelID ?? id) ?? source?.models.get(id)
+          // OpenRouter routing suffixes select an endpoint without changing the underlying model.
+          const routed =
+            source?.provider.id === Provider.ID.openrouter
+              ? source.models.get((config.modelID ?? id).replace(/:(?:floor|nitro)$/, ""))
+              : undefined
+          const base =
+            source?.models.get(config.modelID ?? id) ??
+            source?.models.get(id) ??
+            (routed && { ...routed, modelID: Model.ID.make(config.modelID ?? id) })
           const inherit = changed || !current?.models.has(id)
           // Bind the source at this point in the provider fold. Later source edits/removal
           // and its credential availability must not change an already-defined alias.

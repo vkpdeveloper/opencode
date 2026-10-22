@@ -304,7 +304,8 @@ interface RequestDescriptor {
   readonly binary?: true
 }
 
-const maxSseEventBytes = 16 * 1024 * 1024
+// String.length measures UTF-16 code units, preserving the existing decoded-text budget.
+const maxSseEventCodeUnits = 16 * 1024 * 1024
 
 export function make(options: ClientOptions) {
   const fetch = options.fetch ?? globalThis.fetch
@@ -393,7 +394,6 @@ export function make(options: ClientOptions) {
           }
           if (!next.done) requestOptions?.onActivity?.()
           buffer += decoder.decode(next.value, { stream: !next.done })
-          if (buffer.length > maxSseEventBytes) throw new ClientError("SseEventTooLarge")
           const trailingCarriageReturn = !next.done && buffer.endsWith("\r")
           if (trailingCarriageReturn) buffer = buffer.slice(0, -1)
           buffer = buffer.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
@@ -401,6 +401,7 @@ export function make(options: ClientOptions) {
           if (next.done && buffer !== "") buffer += "\n\n"
           let boundary = buffer.indexOf("\n\n")
           while (boundary >= 0) {
+            if (boundary > maxSseEventCodeUnits) throw new ClientError("SseEventTooLarge")
             const block = buffer.slice(0, boundary)
             buffer = buffer.slice(boundary + 2)
             const data = block
@@ -416,6 +417,9 @@ export function make(options: ClientOptions) {
             }
             boundary = buffer.indexOf("\n\n")
           }
+          // A split blank-line delimiter is framing, not event content.
+          const pendingDelimiter = buffer.endsWith("\n\r") ? 2 : buffer.endsWith("\n") || buffer.endsWith("\r") ? 1 : 0
+          if (buffer.length - pendingDelimiter > maxSseEventCodeUnits) throw new ClientError("SseEventTooLarge")
           if (next.done) return
         }
       } finally {

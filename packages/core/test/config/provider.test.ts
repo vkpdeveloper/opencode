@@ -397,6 +397,114 @@ describe("ConfigProviderPlugin.Plugin", () => {
     }),
   )
 
+  for (const scenario of [
+    { name: "unsuffixed alias", provider: "openrouter", id: "coder", modelID: "openai/gpt-6.1-sol" },
+    { name: "floor alias", provider: "openrouter", id: "coder", modelID: "openai/gpt-6.1-sol:floor" },
+    { name: "nitro alias", provider: "openrouter", id: "coder", modelID: "openai/gpt-6.1-sol:nitro" },
+    { name: "suffix in the model key", provider: "openrouter", id: "openai/gpt-6.1-sol:floor" },
+    {
+      name: "canonical OpenRouter provider alias",
+      provider: "proxy",
+      canonical: "openrouter",
+      id: "coder",
+      modelID: "openai/gpt-6.1-sol:floor",
+    },
+    {
+      name: "explicit context override",
+      provider: "openrouter",
+      id: "coder",
+      modelID: "openai/gpt-6.1-sol:floor",
+      limit: { context: 1_000_000 },
+    },
+    {
+      name: "exact suffixed catalog entry",
+      provider: "openrouter",
+      id: "coder",
+      modelID: "openai/gpt-6.1-sol:floor",
+      exact: true,
+    },
+    {
+      name: "unknown base model",
+      provider: "openrouter",
+      id: "coder",
+      modelID: "openai/unknown:floor",
+      fallback: true,
+    },
+    {
+      name: "non-routing suffix",
+      provider: "openrouter",
+      id: "coder",
+      modelID: "openai/gpt-6.1-sol:extended",
+      fallback: true,
+    },
+    {
+      name: "non-OpenRouter provider",
+      provider: "custom",
+      id: "coder",
+      modelID: "openai/gpt-6.1-sol:floor",
+      fallback: true,
+    },
+  ]) {
+    it.effect(`resolves model metadata for ${scenario.name}`, () =>
+      Effect.gen(function* () {
+        const providers = yield* Provider.Service
+        const models = yield* Model.Service
+        const providerID = Provider.ID.make(scenario.provider)
+        yield* providers.transform((editor) => {
+          const sourceID = scenario.canonical ? Provider.ID.make(scenario.canonical) : providerID
+          editor.update(sourceID, (provider) => {
+            provider.package = "@opencode/ai/providers/openrouter"
+          })
+          editor.models.update(sourceID, Model.ID.make("openai/gpt-6.1-sol"), (model) => {
+            model.limit = { context: 1_050_000, input: 922_000, output: 128_000 }
+            model.capabilities.temperature = false
+          })
+          if (scenario.exact)
+            editor.models.update(sourceID, Model.ID.make("openai/gpt-6.1-sol:floor"), (model) => {
+              model.limit = { context: 64_000, output: 8_000 }
+            })
+        })
+        yield* addPlugin([
+          new Document({
+            type: "document",
+            info: decode({
+              providers: {
+                [scenario.provider]: {
+                  ...(scenario.canonical ? { canonical: scenario.canonical } : {}),
+                  models: {
+                    [scenario.id]: {
+                      ...(scenario.modelID ? { modelID: scenario.modelID } : {}),
+                      name: "Sol Workhorse",
+                      ...(scenario.limit ? { limit: scenario.limit } : {}),
+                    },
+                  },
+                },
+              },
+            }),
+          }),
+        ])
+
+        const model = required(yield* models.get(providerID, Model.ID.make(scenario.id)))
+        expect(model).toMatchObject({
+          id: scenario.id,
+          providerID,
+          modelID: scenario.modelID ?? scenario.id,
+          name: "Sol Workhorse",
+        })
+        expect(model.limit).toEqual(
+          scenario.fallback
+            ? { context: 200_000, output: 32_000 }
+            : scenario.exact
+              ? { context: 64_000, output: 8_000 }
+              : { context: 1_050_000, input: 922_000, output: 128_000, ...scenario.limit },
+        )
+        if (!scenario.fallback && !scenario.exact) expect(model.capabilities.temperature).toBe(false)
+        const resolved = yield* ModelResolver.fromCatalogModel(model)
+        expect(resolved).toMatchObject({ id: scenario.modelID ?? scenario.id })
+      }),
+    )
+  }
+
   it.effect("preserves catalog capabilities unless config overrides them", () =>
     Effect.gen(function* () {
       const providers = yield* Provider.Service

@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import os from "os"
 import path from "path"
+import fs from "node:fs/promises"
 import { ShellParse } from "@opencode/core/shell/parse"
 import { shellParserWasm } from "../src/shell/parser-wasm.workerd"
+import { tmpdir } from "./fixture/tmpdir"
 
 describe("ShellParse", () => {
   test("splits bash commands and derives reusable prefixes", async () => {
@@ -156,6 +158,44 @@ describe("ShellParse", () => {
     })
   })
 
+  for (const portable of [false, true]) {
+    test.each([
+      ["cd layer-a && ls; echo done; cd ../layer-b && ls", ["layer-a", "layer-b"]],
+      ["cd layer-a; cd ../layer-b", ["layer-a", "layer-b"]],
+      ["cd layer-a\npwd\ncd ../layer-b", ["layer-a", "layer-b"]],
+      ["pushd layer-a && pwd; cd ../layer-b", ["layer-a", "layer-b"]],
+      ["cd 'layer a' && cd ../layer-b", ["layer a", "layer-b"]],
+      ["cd layer-a; cd missing; cd ../layer-b", ["layer-a", "layer-a/missing", "layer-b"]],
+      ["cd missing; cd ../outside", ["missing", "../outside"]],
+      ["cd file; cd ../outside", ["file", "../outside"]],
+      ["cd layer-a && cd ../../outside", ["layer-a", "../outside"]],
+      ["(cd layer-a); cd layer-b", ["layer-a", "layer-b"]],
+      ["echo $(cd layer-a); cd layer-b", ["layer-a", "layer-b"]],
+      ["cd layer-a | cat; cd layer-b", ["layer-a", "layer-b"]],
+      ["cd layer-a || cd layer-b; cd layer-b", ["layer-a", "layer-b", "layer-b"]],
+      ["cd layer-a; cd $target; cd layer-b", ["layer-a", "layer-b"]],
+    ])(`${portable ? "portable" : "legacy"} directory tracking: %s`, async (command, expected) => {
+      await using tmp = await tmpdir()
+      await Promise.all(["layer-a", "layer-b", "layer a"].map((name) => fs.mkdir(path.join(tmp.path, name))))
+      await Bun.write(path.join(tmp.path, "file"), "not a directory")
+      const result = await Effect.runPromise(
+        ShellParse.scan(command, "zsh", tmp.path, {
+          portable,
+          isDirectory: (directory) =>
+            Effect.promise(() =>
+              fs.stat(directory).then(
+                (stat) => stat.isDirectory(),
+                () => false,
+              ),
+            ),
+        }),
+      )
+      expect(result.directories.map((directory) => path.resolve(tmp.path, directory))).toEqual(
+        expected.map((directory) => path.resolve(tmp.path, directory)),
+      )
+    })
+  }
+
   test("extracts PowerShell directory parameters", async () => {
     const result = await Effect.runPromise(
       ShellParse.scan("Set-Location -LiteralPath '..\\outside'; Get-ChildItem", "pwsh", "C:\\workspace"),
@@ -168,9 +208,7 @@ describe("ShellParse", () => {
     expect(bash.directories).toEqual([path.join(os.homedir(), "src")])
 
     const backslash = await Effect.runPromise(ShellParse.scan("cd '~\\src'", "/bin/bash", "/workspace"))
-    expect(backslash.directories).toEqual(
-      process.platform === "win32" ? [path.join(os.homedir(), "src")] : ["~\\src"],
-    )
+    expect(backslash.directories).toEqual(process.platform === "win32" ? [path.join(os.homedir(), "src")] : ["~\\src"])
 
     const powershell = await Effect.runPromise(
       ShellParse.scan('Set-Location "$PWD/src"; Set-Location $PSHOME', "/usr/local/bin/pwsh", "/workspace"),

@@ -11,6 +11,8 @@ export type OpaqueReason =
   | "unterminated-escape"
   | "unterminated-quote"
 
+export type Sequence = { before?: string; after?: string }
+
 type Command = {
   resource: string
   words: string[]
@@ -21,6 +23,8 @@ type Command = {
   declaration?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
+  // Opt-in boundaries for directory tracking; nested commands have independent shell state.
+  sequence?: Sequence
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
@@ -138,6 +142,7 @@ type BashContext = {
   boundDollar?: boolean
   boundOpen?: boolean
   variableSink?: boolean
+  sequence?: boolean
 }
 
 type BashHeredoc = {
@@ -192,6 +197,7 @@ type BashState = {
   dangling: boolean
   // Receives each word's literal text when the list is a command substitution, whose output it stands in for.
   outer: BashText | undefined
+  sequence: Sequence | undefined
 }
 
 // A word's cooked text, the literal text it decodes to apart from its expansions, and the literal text of its
@@ -205,9 +211,9 @@ type BashEvaluation = "arithmetic" | "binding" | "deferred"
 // Dash alike, so it is the default.
 export type Dialect = "bash" | "zsh" | "posix"
 
-export function scan(input: string, dialect: Dialect = "posix"): Result {
+export function scan(input: string, dialect: Dialect = "posix", options?: { sequence?: boolean }): Result {
   if (input.length > MAX_INPUT_LENGTH) return { kind: "opaque", reason: "invalid-structure" }
-  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect }
+  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect, ...options }
   const result = scanBash(input, 0, 0, context)
   if (result.kind === "opaque") return result
   if (context.boundDollar && context.boundOpen && context.variableSink)
@@ -341,7 +347,7 @@ function bashBuiltinIndex(state: BashState) {
   return name
 }
 
-function finishBashCommand(state: BashState, boundary = false) {
+function finishBashCommand(state: BashState, boundary = false, after?: string) {
   finishBashWord(state)
   if (state.redirectTarget) state.invalid ??= "invalid-redirect"
   state.redirectTarget = false
@@ -357,6 +363,7 @@ function finishBashCommand(state: BashState, boundary = false) {
       resource,
       words: state.words.slice(name),
       rawWords: state.rawWords.slice(name),
+      ...(state.sequence && state.structures.length === 0 ? { sequence: { ...state.sequence, after } } : {}),
       ...(name === 0 && BASH_DECLARATIONS.has(state.rawWords[0]) && resource.startsWith(state.rawWords[0])
         ? { declaration: true as const }
         : {}),
@@ -425,6 +432,7 @@ function finishBashCommand(state: BashState, boundary = false) {
   state.ampersandRedirectWords = undefined
   state.compoundEnd = false
   state.dangling = false
+  if (state.sequence) state.sequence.before = after
 }
 
 function scanBash(
@@ -468,6 +476,7 @@ function scanBash(
     compoundEnd: false,
     dangling: false,
     outer,
+    sequence: context.sequence && depth === 0 ? {} : undefined,
   }
   for (let index = start; index < input.length; index++) {
     if (--context.remaining < 0) return { kind: "opaque", reason: "invalid-structure" }
@@ -705,7 +714,7 @@ function scanBashOperatorOrSeparator(
       return { kind: "opaque", reason: "compound-command" }
   }
   if (separator === "\n" && !pending(state)) return readBashHeredocs(state, index, depth, context)
-  finishBashCommand(state, true)
+  finishBashCommand(state, true, separator)
   if (structure?.kind === "for" && structure.phase === "header") structure.phase = "do"
   state.dangling = separator !== "&" && separator !== ";" && separator !== "\n"
   // Reprocess the newline to read pending heredoc bodies.

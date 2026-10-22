@@ -2,10 +2,78 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import os from "os"
 import path from "path"
+import fs from "fs/promises"
 import { ShellParse } from "@opencode/core/shell/parse"
 import { shellParserWasm } from "../src/shell/parser-wasm.workerd"
+import { tmpdir } from "./fixture/tmpdir"
 
 describe("ShellParse", () => {
+  test.each([false, true])("tracks directory changes in simple lists (portable: %s)", async (portable) => {
+    await using tmp = await tmpdir()
+    await Promise.all([fs.mkdir(path.join(tmp.path, "a")), fs.mkdir(path.join(tmp.path, "b"))])
+    const options = {
+      portable,
+      directoryExists: (directory: string) =>
+        Effect.promise(() =>
+          fs.stat(directory).then(
+            (stat) => stat.isDirectory(),
+            () => false,
+          ),
+        ),
+    }
+    for (const command of [
+      "cd a && ls; echo done; cd ../b && ls",
+      `cd '${path.join(tmp.path, "a")}' && ls; cd ../b && ls`,
+      "cd a; cd ../b",
+      "cd a\n# next directory\ncd ../b",
+      "cd a && cd ../b",
+      "cd a &&\n# next directory\ncd ../b",
+      "cd -- a && cd -- ../b",
+      "pushd a && cd ../b",
+    ]) {
+      const result = await Effect.runPromise(ShellParse.scan(command, "bash", tmp.path, options))
+      expect(result.directories.map((directory) => path.resolve(tmp.path, directory))).toEqual([
+        path.join(tmp.path, "a"),
+        path.join(tmp.path, "b"),
+      ])
+    }
+    for (const command of ["pushd a && popd && cd b", "cd a && cd - && cd b"]) {
+      const result = await Effect.runPromise(ShellParse.scan(command, "bash", tmp.path, options))
+      expect(result.directories.map((directory) => path.resolve(tmp.path, directory))).toEqual([
+        path.join(tmp.path, "a"),
+        tmp.path,
+        path.join(tmp.path, "b"),
+      ])
+    }
+    for (const command of [
+      "cd missing; cd b",
+      "cd missing && cd a; cd b",
+      "false && cd a; cd b",
+      "cd a || echo failed; cd b",
+      "cd a | cat; cd b",
+      "cd a & cd b",
+      "(cd a); cd b",
+      "echo $(cd a); cd b",
+      "f() { cd a; }; cd b",
+      "if true; then cd a; fi; cd b",
+    ]) {
+      const result = await Effect.runPromise(ShellParse.scan(command, "bash", tmp.path, options))
+      expect(result.directories.map((directory) => path.resolve(tmp.path, directory)).at(-1)).toBe(
+        path.join(tmp.path, "b"),
+      )
+    }
+    const result = await Effect.runPromise(ShellParse.scan("cd a && cd ../../outside", "bash", tmp.path, options))
+    expect(result.directories).toEqual(["a", path.resolve(tmp.path, "../outside")])
+    for (const command of ["cd a; cd ../b | cat", "cd a; cd ../b || echo failed", "cd a; cd ../b & wait"]) {
+      const result = await Effect.runPromise(ShellParse.scan(command, "bash", tmp.path, options))
+      expect(result.directories).toEqual(["a", "../b"])
+    }
+    const conditional = await Effect.runPromise(
+      ShellParse.scan("cd new-directory && cd ../b", "bash", tmp.path, { portable }),
+    )
+    expect(conditional.directories).toEqual(["new-directory", path.join(tmp.path, "b")])
+  })
+
   test("splits bash commands and derives reusable prefixes", async () => {
     const result = await Effect.runPromise(
       ShellParse.scan("git status && npm run test -- --watch", "/bin/bash", "/workspace"),

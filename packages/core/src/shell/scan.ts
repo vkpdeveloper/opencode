@@ -21,6 +21,8 @@ type Command = {
   declaration?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
+  // Opt-in source positions for directory tracking in simple top-level lists.
+  range?: { start: number; end: number }
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
@@ -138,6 +140,7 @@ type BashContext = {
   boundDollar?: boolean
   boundOpen?: boolean
   variableSink?: boolean
+  positions?: boolean
 }
 
 type BashHeredoc = {
@@ -153,6 +156,7 @@ type BashHeredoc = {
 type BashState = {
   input: string
   context: BashContext
+  topLevel: boolean
   commands: Command[]
   nestedCommands: Command[]
   words: string[]
@@ -205,9 +209,9 @@ type BashEvaluation = "arithmetic" | "binding" | "deferred"
 // Dash alike, so it is the default.
 export type Dialect = "bash" | "zsh" | "posix"
 
-export function scan(input: string, dialect: Dialect = "posix"): Result {
+export function scan(input: string, dialect: Dialect = "posix", positions = false): Result {
   if (input.length > MAX_INPUT_LENGTH) return { kind: "opaque", reason: "invalid-structure" }
-  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect }
+  const context: BashContext = { remaining: MAX_INPUT_LENGTH * MAX_SUBSTITUTION_DEPTH, dialect, positions }
   const result = scanBash(input, 0, 0, context)
   if (result.kind === "opaque") return result
   if (context.boundDollar && context.boundOpen && context.variableSink)
@@ -355,6 +359,9 @@ function finishBashCommand(state: BashState, boundary = false) {
       .replace(/^[ \t\n]+|[ \t\n]+$/g, "")
     const command: Command = {
       resource,
+      ...(state.context.positions && state.topLevel && !state.structures.length
+        ? { range: { start: state.commandStart ?? 0, end: state.wordEnd } }
+        : {}),
       words: state.words.slice(name),
       rawWords: state.rawWords.slice(name),
       ...(name === 0 && BASH_DECLARATIONS.has(state.rawWords[0]) && resource.startsWith(state.rawWords[0])
@@ -441,6 +448,7 @@ function scanBash(
   const state: BashState = {
     input,
     context,
+    topLevel: depth === 0,
     commands: [],
     nestedCommands: [],
     words: [],

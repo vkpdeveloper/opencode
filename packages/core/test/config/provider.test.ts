@@ -397,6 +397,142 @@ describe("ConfigProviderPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("inherits OpenRouter catalog metadata for routing suffixes and keeps request IDs", () =>
+    Effect.gen(function* () {
+      const providers = yield* Provider.Service
+      const models = yield* Model.Service
+      const modelID = Model.ID.make("openai/gpt-6.1-sol")
+      yield* providers.transform((editor) => {
+        editor.update(Provider.ID.openrouter, (provider) => {
+          provider.package = "@opencode/ai/providers/openrouter"
+        })
+        editor.models.update(Provider.ID.openrouter, modelID, (model) => {
+          model.limit = { context: 1_050_000, input: 922_000, output: 128_000 }
+          model.capabilities = { tools: true, input: ["text", "image", "pdf"], output: ["text"] }
+          model.variants = [{ id: Model.VariantID.make("high"), settings: { effort: "high" } }]
+        })
+      })
+      const result = ConfigNormalize.normalize({
+        model: "openrouter/coder",
+        provider: {
+          openrouter: {
+            models: {
+              coder: { id: `${modelID}:floor`, name: "Sol Workhorse Floor" },
+              plain: { id: modelID },
+              fast: { id: `${modelID}:nitro` },
+              override: { id: `${modelID}:floor`, limit: { context: 1_000_000, output: 64_000 } },
+              partial: { id: `${modelID}:floor`, limit: { context: 1_000_000 } },
+              output: { id: `${modelID}:floor`, limit: { output: 64_000 } },
+              [`${modelID}:floor`]: {},
+              unknown: { id: "unknown/model:floor" },
+            },
+          },
+        },
+      })
+      if (result.type !== "normalized") throw new Error("Expected normalized config")
+      expect(result.diagnostics).toEqual([])
+      yield* addPlugin([new Document({ type: "document", info: decode(result.encoded) })])
+
+      const catalog = required(yield* models.get(Provider.ID.openrouter, modelID))
+      yield* Effect.forEach(
+        [
+          ["coder", `${modelID}:floor`],
+          ["plain", modelID],
+          ["fast", `${modelID}:nitro`],
+          [`${modelID}:floor`, `${modelID}:floor`],
+        ],
+        Effect.fn(function* ([id, requestID]) {
+          const model = required(yield* models.get(Provider.ID.openrouter, Model.ID.make(id)))
+          expect(model).toMatchObject({
+            id,
+            modelID: requestID,
+            providerID: Provider.ID.openrouter,
+            limit: { context: 1_050_000, input: 922_000, output: 128_000 },
+            capabilities: catalog.capabilities,
+            variants: catalog.variants,
+          })
+          expect(requestID).toBe((yield* ModelResolver.fromCatalogModel(model)).id)
+        }),
+      )
+      expect((yield* models.default())?.name).toBe("Sol Workhorse Floor")
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("override")))?.limit).toEqual({
+        context: 1_000_000,
+        input: 922_000,
+        output: 64_000,
+      })
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("unknown")))?.limit).toEqual({
+        context: 200_000,
+        output: 32_000,
+      })
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("partial")))?.limit).toEqual({
+        context: 1_000_000,
+        input: 922_000,
+        output: 128_000,
+      })
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("output")))?.limit).toEqual({
+        context: 1_050_000,
+        input: 922_000,
+        output: 64_000,
+      })
+      expect(catalog.modelID).toBe(modelID)
+    }),
+  )
+
+  it.effect("prefers exact OpenRouter catalog entries and leaves other providers' suffixes alone", () =>
+    Effect.gen(function* () {
+      const providers = yield* Provider.Service
+      const models = yield* Model.Service
+      yield* providers.transform((editor) => {
+        editor.models.update(Provider.ID.openrouter, Model.ID.make("vendor/model"), (model) => {
+          model.limit = { context: 1_000_000, output: 128_000 }
+        })
+        editor.models.update(Provider.ID.openrouter, Model.ID.make("vendor/model:free"), (model) => {
+          model.limit = { context: 64_000, output: 8_000 }
+        })
+        editor.models.update(Provider.ID.openrouter, Model.ID.make("existing"), (model) => {
+          model.limit = { context: 256_000, output: 16_000 }
+        })
+        editor.models.update(Provider.ID.make("custom"), Model.ID.make("vendor/model"), (model) => {
+          model.limit = { context: 1_000_000, output: 128_000 }
+        })
+      })
+      yield* addPlugin([
+        new Document({
+          type: "document",
+          info: decode({
+            providers: {
+              openrouter: {
+                models: {
+                  exact: { modelID: "vendor/model:free" },
+                  existing: { modelID: "vendor/model:floor" },
+                },
+              },
+              custom: { models: { alias: { modelID: "vendor/model:floor" } } },
+              proxy: { canonical: "openrouter", models: { alias: { modelID: "vendor/model:floor" } } },
+            },
+          }),
+        }),
+      ])
+
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("exact")))?.limit).toEqual({
+        context: 64_000,
+        output: 8_000,
+      })
+      expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("existing")))?.limit).toEqual({
+        context: 256_000,
+        output: 16_000,
+      })
+      expect((yield* models.get(Provider.ID.make("custom"), Model.ID.make("alias")))?.limit).toEqual({
+        context: 200_000,
+        output: 32_000,
+      })
+      expect((yield* models.get(Provider.ID.make("proxy"), Model.ID.make("alias")))?.limit).toEqual({
+        context: 1_000_000,
+        output: 128_000,
+      })
+    }),
+  )
+
   it.effect("preserves catalog capabilities unless config overrides them", () =>
     Effect.gen(function* () {
       const providers = yield* Provider.Service

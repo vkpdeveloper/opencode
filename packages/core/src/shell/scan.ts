@@ -21,6 +21,8 @@ type Command = {
   declaration?: true
   // Words after a trailing redirect are destinations in the legacy command span.
   redirectWordCount?: number
+  // Only outer, sequential directory changes can affect later commands in this shell.
+  sequence?: number
 }
 
 // Opaque describes a parsing limitation, not a permission decision.
@@ -192,6 +194,10 @@ type BashState = {
   dangling: boolean
   // Receives each word's literal text when the list is a command substitution, whose output it stands in for.
   outer: BashText | undefined
+  topLevel: boolean
+  pipeline: boolean
+  conditionalList: boolean
+  listStart: number
 }
 
 // A word's cooked text, the literal text it decodes to apart from its expansions, and the literal text of its
@@ -341,7 +347,7 @@ function bashBuiltinIndex(state: BashState) {
   return name
 }
 
-function finishBashCommand(state: BashState, boundary = false) {
+function finishBashCommand(state: BashState, boundary = false, separator = ";") {
   finishBashWord(state)
   if (state.redirectTarget) state.invalid ??= "invalid-redirect"
   state.redirectTarget = false
@@ -357,6 +363,14 @@ function finishBashCommand(state: BashState, boundary = false) {
       resource,
       words: state.words.slice(name),
       rawWords: state.rawWords.slice(name),
+      ...(state.topLevel &&
+      !state.structures.length &&
+      !state.pipeline &&
+      !state.conditionalList &&
+      !["|", "|&", "||", "&"].includes(separator) &&
+      ["cd", "chdir", "pushd"].includes(state.rawWords[name])
+        ? { sequence: state.listStart }
+        : {}),
       ...(name === 0 && BASH_DECLARATIONS.has(state.rawWords[0]) && resource.startsWith(state.rawWords[0])
         ? { declaration: true as const }
         : {}),
@@ -468,6 +482,10 @@ function scanBash(
     compoundEnd: false,
     dangling: false,
     outer,
+    topLevel: depth === 0,
+    pipeline: false,
+    conditionalList: false,
+    listStart: 0,
   }
   for (let index = start; index < input.length; index++) {
     if (--context.remaining < 0) return { kind: "opaque", reason: "invalid-structure" }
@@ -705,7 +723,16 @@ function scanBashOperatorOrSeparator(
       return { kind: "opaque", reason: "compound-command" }
   }
   if (separator === "\n" && !pending(state)) return readBashHeredocs(state, index, depth, context)
-  finishBashCommand(state, true)
+  finishBashCommand(state, true, separator)
+  if (separator === "||" || separator === "&") {
+    for (const command of state.commands.slice(state.listStart)) delete command.sequence
+  }
+  state.pipeline = separator === "|" || separator === "|&"
+  if (separator === "||") state.conditionalList = true
+  if ([";", "\n", "&"].includes(separator)) {
+    state.conditionalList = false
+    state.listStart = state.commands.length
+  }
   if (structure?.kind === "for" && structure.phase === "header") structure.phase = "do"
   state.dangling = separator !== "&" && separator !== ";" && separator !== "\n"
   // Reprocess the newline to read pending heredoc bodies.

@@ -295,6 +295,60 @@ describe("ShellTool scanner permissions", () => {
   for (const portable of [false, true]) {
     const scanner = portable ? "native" : "legacy"
 
+    test(`${scanner}: relative cd chains only request directories the command enters`, () =>
+      withScanner(portable, (registry, fixture) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Promise.all(["layer-a", "layer-b"].map((name) => fs.mkdir(path.join(fixture.active, name)))),
+          )
+          yield* Effect.promise(() => Bun.write(path.join(fixture.active, "layer-a", "a.txt"), "a\n"))
+          yield* Effect.promise(() => Bun.write(path.join(fixture.active, "layer-b", "b.txt"), "b\n"))
+          const agents = yield* Agent.Service
+          yield* agents.transform((editor) =>
+            editor.update(toolIdentity.agent, (agent) => {
+              agent.permissions = [
+                { action: "shell", resource: "*", effect: "allow" },
+                { action: "external_directory", resource: "*", effect: "ask" },
+              ]
+            }),
+          )
+          const marker = path.join(fixture.active, "marker")
+          for (const first of ["layer-a", path.join(fixture.active, "layer-a")]) {
+            const result = yield* runPermissionCommand(
+              registry,
+              `cd '${first}' && ls; echo done; cd ../layer-b && ls && pwd > '${marker}'`,
+              marker,
+              [],
+            )
+            expect(result.requests).toEqual([])
+            expect(result.exit).toMatchObject({
+              _tag: "Success",
+              value: {
+                status: "completed",
+                metadata: { exit: 0 },
+                content: [{ type: "text", text: "a.txt\ndone\nb.txt\n" }],
+              },
+            })
+            expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe(
+              `${path.join(fixture.active, "layer-b")}\n`,
+            )
+            yield* Effect.promise(() => fs.unlink(marker))
+          }
+
+          const external = yield* runPermissionCommand(
+            registry,
+            `cd layer-a && pwd; cd ../../outside && printf reached > '${marker}'`,
+            marker,
+            ["reject"],
+          )
+          expect(external.requests).toMatchObject([
+            { action: "external_directory", resources: [path.join(fixture.outside, "*")] },
+          ])
+          expect(Exit.isFailure(external.exit)).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        }),
+      ))
+
     test(`${scanner}: declarations reuse approvals while substitutions retain reject/once/always behavior`, () =>
       withScanner(portable, (registry, fixture) =>
         Effect.gen(function* () {

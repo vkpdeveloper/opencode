@@ -397,6 +397,102 @@ describe("ConfigProviderPlugin.Plugin", () => {
     }),
   )
 
+  for (const suffix of ["floor", "nitro"]) {
+    it.effect(`inherits OpenRouter catalog limits for :${suffix} routing aliases`, () =>
+      Effect.gen(function* () {
+        const providers = yield* Provider.Service
+        const models = yield* Model.Service
+        const modelID = `openai/gpt-6.1-sol:${suffix}`
+        const limit = { context: 1_050_000, input: 922_000, output: 128_000 }
+        yield* providers.transform((editor) => {
+          editor.update(Provider.ID.openrouter, (provider) => {
+            provider.package = "@opencode/ai/providers/openrouter"
+          })
+          editor.models.update(Provider.ID.openrouter, Model.ID.make("openai/gpt-6.1-sol"), (model) => {
+            model.limit = limit
+          })
+        })
+        const result = ConfigNormalize.normalize({
+          provider: {
+            openrouter: {
+              models: {
+                coder: { id: modelID, name: "Sol Workhorse" },
+                [modelID]: {},
+                unknown: { id: `openai/unknown:${suffix}` },
+              },
+            },
+          },
+        })
+        if (result.type !== "normalized") throw new Error("Expected normalized config")
+        expect(result.diagnostics).toEqual([])
+        yield* addPlugin([
+          new Document({ type: "document", info: decode(result.encoded) }),
+          new Document({
+            type: "document",
+            info: decode({
+              providers: { openrouter: { models: { override: { modelID, limit: { context: 1_000_000 } } } } },
+            }),
+          }),
+        ])
+
+        expect(yield* models.get(Provider.ID.openrouter, Model.ID.make("coder"))).toMatchObject({
+          id: "coder",
+          modelID,
+          name: "Sol Workhorse",
+          limit,
+        })
+        expect(yield* models.get(Provider.ID.openrouter, Model.ID.make(modelID))).toMatchObject({ modelID, limit })
+        expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("override")))?.limit).toEqual({
+          ...limit,
+          context: 1_000_000,
+        })
+        expect((yield* models.get(Provider.ID.openrouter, Model.ID.make("unknown")))?.limit).toEqual({
+          context: 200_000,
+          output: 32_000,
+        })
+      }),
+    )
+  }
+
+  for (const item of [
+    { name: "exact routing model", package: "@opencode/ai/providers/openrouter", suffix: "floor", exact: true },
+    { name: "free variant", package: "@opencode/ai/providers/openrouter", suffix: "free", exact: false },
+    { name: "extended variant", package: "@opencode/ai/providers/openrouter", suffix: "extended", exact: false },
+    { name: "another provider", package: "@opencode/ai/providers/openai-compatible", suffix: "floor", exact: false },
+  ]) {
+    it.effect(`preserves catalog lookup behavior for ${item.name}`, () =>
+      Effect.gen(function* () {
+        const providers = yield* Provider.Service
+        const models = yield* Model.Service
+        const providerID = Provider.ID.make("custom")
+        const modelID = `openai/gpt-6.1-sol:${item.suffix}`
+        yield* providers.transform((editor) => {
+          editor.update(providerID, (provider) => {
+            provider.package = item.package
+          })
+          editor.models.update(providerID, Model.ID.make("openai/gpt-6.1-sol"), (model) => {
+            model.limit = { context: 1_050_000, output: 128_000 }
+          })
+          if (item.exact)
+            editor.models.update(providerID, Model.ID.make(modelID), (model) => {
+              model.limit = { context: 500_000, output: 64_000 }
+            })
+        })
+        yield* addPlugin([
+          new Document({
+            type: "document",
+            info: decode({ providers: { custom: { models: { coder: { modelID } } } } }),
+          }),
+        ])
+
+        expect(yield* models.get(providerID, Model.ID.make("coder"))).toMatchObject({
+          modelID,
+          limit: item.exact ? { context: 500_000, output: 64_000 } : { context: 200_000, output: 32_000 },
+        })
+      }),
+    )
+  }
+
   it.effect("preserves catalog capabilities unless config overrides them", () =>
     Effect.gen(function* () {
       const providers = yield* Provider.Service
